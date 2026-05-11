@@ -10,6 +10,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <random>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err__ = (call); \
@@ -224,7 +225,7 @@ static void usage(const char* argv0) {
         "  --blocks N              CUDA blocks (default SMs*32)\n"
         "  --threads N             threads/block (default 256)\n"
         "  --iters N               iterations/thread per launch (default 256)\n"
-        "  --prefix 0x<24B>        nonce prefix (default deterministic 00..17)\n"
+        "  --prefix 0x<24B>        nonce prefix (default random; fixed only for debugging)\n"
         "  --start N               low counter start (default 0)\n"
         "  --selftest              run Keccak selftest\n",
         argv0);
@@ -266,7 +267,8 @@ int main(int argc, char** argv) {
     if (!prefix_hex.empty()) {
         if (!parse_hex_bytes(prefix_hex, h_prefix, 24)) { fprintf(stderr, "bad prefix\n"); return 2; }
     } else {
-        for (int i = 0; i < 24; i++) h_prefix[i] = (unsigned char)i;
+        std::random_device rd;
+        for (int i = 0; i < 24; i++) h_prefix[i] = (unsigned char)(rd() & 0xff);
     }
 
     CUDA_CHECK(cudaSetDevice(device));
@@ -308,6 +310,7 @@ int main(int argc, char** argv) {
             std::cout << "  \"hashes\": " << total << ",\n";
             std::cout << "  \"hashrate_hps\": " << std::fixed << std::setprecision(0) << hps << ",\n";
             std::cout << "  \"hashrate_ghps\": " << std::fixed << std::setprecision(3) << (hps / 1e9) << ",\n";
+            std::cout << "  \"prefix\": \"" << hex_bytes(h_prefix, 24) << "\",\n";
             std::cout << "  \"launches\": " << launches << ",\n";
             std::cout << "  \"found\": " << (h_found.flag ? "true" : "false");
             if (h_found.flag) {

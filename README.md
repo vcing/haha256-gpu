@@ -49,10 +49,12 @@ Then run:
 .venv/bin/python mine_submit.py
 ```
 
+`mine_submit.py` now polls live chain state while the CUDA subprocess is running. If `challenge`, `target/currentDifficulty`, or `epoch` changes, it stops the stale CUDA slice and immediately restarts with fresh state.
+
 Equivalent explicit one-off command:
 
 ```bash
-.venv/bin/python mine_submit.py --wallet 0xYourWallet --round-seconds 35 --once
+.venv/bin/python mine_submit.py --wallet 0xYourWallet --round-seconds 35 --state-poll-seconds 3 --once
 ```
 
 This finds and verifies a nonce but does not sign or broadcast anything unless `HASH256_SUBMIT=true` in `.env` or `--submit` is passed.
@@ -92,5 +94,7 @@ At target `0x000000000ffffffff...`, expected work is about `2^36` hashes, so the
 
 - Ethereum Keccak padding is used, not FIPS SHA3.
 - The challenge is wallet-bound and epoch-bound; stale nonce is possible near epoch rotations.
+- `mine_submit.py` auto-retargets: it refreshes state before every slice and polls during the CUDA run (`HASH256_STATE_POLL_SECONDS`, default 3s). If live `challenge` / `target` / `epoch` changes, the current CUDA subprocess is terminated and restarted with fresh difficulty.
+- Fixed `HASH256_PREFIX` is for debugging only. Normal runs use a fresh random 24-byte prefix per slice to avoid repeating the same nonce range.
 - The contract caps mint count per block; transaction may revert despite a valid hash if it lands too late or block cap is reached.
 - Public RPCs may rate-limit; use a paid/private RPC for real submit.

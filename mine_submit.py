@@ -7,6 +7,7 @@ and only signs/broadcasts when --submit is passed and HASH256_PRIVATE_KEY is set
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -14,15 +15,12 @@ import urllib.request
 from decimal import Decimal
 from pathlib import Path
 
-from eth_account import Account
-from eth_utils import keccak, to_checksum_address
-
 ROOT = Path(__file__).resolve().parent
 CONTRACT = '0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc'
 CHAIN_ID = 1
 SEL_MINING_STATE = '0xf06d67bb'       # miningState()
 SEL_GET_CHALLENGE = '0xf37381ad'      # getChallenge(address)
-SEL_MINE = '0x' + keccak(text='mine(uint256)').hex()[:8]
+SEL_MINE = '0x4d474898'                   # mine(uint256)
 DEFAULT_RPCS = [
     'https://ethereum.publicnode.com',
     'https://eth.llamarpc.com',
@@ -62,6 +60,11 @@ def env_bool(name: str, default: bool = False) -> bool:
 def env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return default if value in (None, '') else int(value)
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return default if value in (None, '') else float(value)
 
 
 def env_str(name: str, default=None):
@@ -158,6 +161,8 @@ def get_state(rpc: Rpc, wallet: str):
 
 
 def verify_hit(challenge_hex: str, target_hex: str, nonce_hex: str, expected_hash_hex: str | None = None):
+    from eth_utils import keccak
+
     challenge = bytes.fromhex(strip0x(challenge_hex))
     target = int(strip0x(target_hex), 16)
     nonce = bytes.fromhex(strip0x(nonce_hex))
@@ -172,25 +177,85 @@ def verify_hit(challenge_hex: str, target_hex: str, nonce_hex: str, expected_has
     return True, got, None
 
 
-def run_miner(args, state):
+def run_miner(args, state, rpc: Rpc, wallet: str):
+    """Run one CUDA mining slice.
+
+    The CUDA binary itself searches a fixed challenge/target.  This coordinator
+    polls chain state while the subprocess is running and aborts the slice as
+    soon as challenge/target/epoch changes, so the next loop mines against the
+    fresh difficulty instead of wasting a full round on stale work.
+    """
+    prefix = args.prefix or ('0x' + secrets.token_bytes(24).hex())
     cmd = [
         args.binary, '--benchmark', '--seconds', str(args.round_seconds),
         '--device', str(args.device), '--threads', str(args.threads),
         '--blocks', str(args.blocks), '--iters', str(args.iters),
         '--challenge', state['challenge'], '--target', state['target'],
+        '--prefix', prefix,
     ]
-    if args.prefix:
-        cmd += ['--prefix', args.prefix]
     eprint('[miner]', ' '.join(cmd))
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.stderr:
-        eprint(proc.stderr.strip())
+    proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    stale_reason = None
+    while proc.poll() is None:
+        if not args.restart_on_state_change or args.state_poll_seconds <= 0:
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+            continue
+        try:
+            proc.wait(timeout=args.state_poll_seconds)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.poll() is not None:
+            break
+        try:
+            fresh = get_state(rpc, wallet)
+        except Exception as exc:
+            eprint(f'[warn] state poll failed while miner is running: {exc}')
+            continue
+        changed = [
+            key for key in ('challenge', 'target', 'epoch')
+            if str(fresh.get(key)).lower() != str(state.get(key)).lower()
+        ]
+        if changed:
+            stale_reason = {
+                'changed': changed,
+                'old_epoch': state.get('epoch'),
+                'new_epoch': fresh.get('epoch'),
+                'old_target': state.get('target'),
+                'new_target': fresh.get('target'),
+            }
+            eprint(f'[retarget] live state changed ({",".join(changed)}); stopping stale CUDA slice')
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            if stderr:
+                eprint(stderr.strip())
+            return {
+                'found': False,
+                'stale_restarted': True,
+                'prefix': prefix,
+                'reason': stale_reason,
+                'stdout_tail': stdout[-500:],
+            }
+
+    stdout, stderr = proc.communicate()
+    if stderr:
+        eprint(stderr.strip())
     if proc.returncode != 0:
-        raise RuntimeError(f'miner exited {proc.returncode}: {proc.stdout[-500:]}')
-    start = proc.stdout.find('{')
+        raise RuntimeError(f'miner exited {proc.returncode}: {stdout[-500:]}')
+    start = stdout.find('{')
     if start < 0:
-        raise RuntimeError(f'miner produced no JSON: {proc.stdout[-500:]}')
-    return json.loads(proc.stdout[start:])
+        raise RuntimeError(f'miner produced no JSON: {stdout[-500:]}')
+    out = json.loads(stdout[start:])
+    out.setdefault('prefix', prefix)
+    return out
 
 
 def gwei_to_wei(x) -> int:
@@ -263,6 +328,8 @@ def main():
     ap.add_argument('--once', action='store_true', default=env_bool('HASH256_ONCE', False), help='Exit after first found nonce / submitted tx.')
     ap.add_argument('--max-rounds', type=int, default=env_int('HASH256_MAX_ROUNDS', 0), help='0 = unlimited')
     ap.add_argument('--round-seconds', type=int, default=env_int('HASH256_ROUND_SECONDS', 20), help='Miner subprocess duration before state refresh')
+    ap.add_argument('--state-poll-seconds', type=float, default=env_float('HASH256_STATE_POLL_SECONDS', 3.0), help='Poll chain state while CUDA is running; 0 disables mid-round polling')
+    ap.add_argument('--restart-on-state-change', action=argparse.BooleanOptionalAction, default=env_bool('HASH256_RESTART_ON_STATE_CHANGE', True), help='Stop/restart CUDA slice when challenge/target/epoch changes')
     ap.add_argument('--rpc', action='append', default=[], help='Optional RPC URL; may repeat. Default uses public RPCs.')
     ap.add_argument('--binary', default=env_str('HASH256_CUDA_BINARY', str(ROOT / 'hash256-cuda')))
     ap.add_argument('--device', type=int, default=env_int('HASH256_DEVICE', 0))
@@ -279,6 +346,12 @@ def main():
     ap.add_argument('--fallback-gas', type=int, default=env_int('HASH256_FALLBACK_GAS', 300000))
     ap.add_argument('--receipt-timeout', type=int, default=env_int('HASH256_RECEIPT_TIMEOUT', 120))
     args = ap.parse_args()
+
+    try:
+        from eth_account import Account
+        from eth_utils import to_checksum_address
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f'Missing Python dependency {exc.name!r}. Install with: python -m pip install -r requirements.txt')
 
     pk = os.environ.get('HASH256_PRIVATE_KEY')
     account = None
@@ -309,7 +382,7 @@ def main():
         rounds += 1
         state = get_state(rpc, wallet)
         print(json.dumps({'event': 'state', **state}, indent=2), flush=True)
-        out = run_miner(args, state)
+        out = run_miner(args, state, rpc, wallet)
         print(json.dumps({'event': 'miner', **out}, indent=2), flush=True)
         if not out.get('found'):
             if args.max_rounds and rounds >= args.max_rounds:
