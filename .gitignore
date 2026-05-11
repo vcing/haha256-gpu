@@ -1,0 +1,20 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build artifacts
+hash256-cuda
+*.o
+*.so
+*.a
+
+# Logs
+*.log
+logs/
